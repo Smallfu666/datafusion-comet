@@ -16,13 +16,8 @@
 // under the License.
 
 use crate::{arithmetic_overflow_error, EvalMode};
-use arrow::array::{
-    as_primitive_array, cast::AsArray, Array, ArrayRef, ArrowNativeTypeOp, ArrowPrimitiveType,
-    BooleanArray, Int64Array, PrimitiveArray,
-};
-use arrow::datatypes::{
-    ArrowNativeType, DataType, Field, FieldRef, Int16Type, Int32Type, Int64Type, Int8Type,
-};
+use arrow::array::{cast::AsArray, Array, ArrayRef, ArrowNativeTypeOp, BooleanArray, Int64Array};
+use arrow::datatypes::{DataType, Field, FieldRef, Int64Type};
 use datafusion::common::{DataFusionError, Result as DFResult, ScalarValue};
 use datafusion::logical_expr::function::{AccumulatorArgs, StateFieldsArgs};
 use datafusion::logical_expr::Volatility::Immutable;
@@ -116,43 +111,18 @@ impl SumIntegerAccumulatorLegacy {
 
 impl Accumulator for SumIntegerAccumulatorLegacy {
     fn update_batch(&mut self, values: &[ArrayRef]) -> DFResult<()> {
-        fn update_sum<T>(int_array: &PrimitiveArray<T>, mut sum: i64) -> DFResult<i64>
-        where
-            T: ArrowPrimitiveType,
-        {
-            for i in 0..int_array.len() {
-                if !int_array.is_null(i) {
-                    let v = int_array.value(i).to_i64().ok_or_else(|| {
-                        DataFusionError::Internal(format!(
-                            "Failed to convert value {:?} to i64",
-                            int_array.value(i)
-                        ))
-                    })?;
-                    sum = v.add_wrapping(sum);
-                }
-            }
-            Ok(sum)
-        }
-
         let values = &values[0];
         if values.len() == values.null_count() {
             return Ok(());
         }
 
-        let running_sum = self.sum.unwrap_or(0);
-        let sum = match values.data_type() {
-            DataType::Int64 => update_sum(as_primitive_array::<Int64Type>(values), running_sum)?,
-            DataType::Int32 => update_sum(as_primitive_array::<Int32Type>(values), running_sum)?,
-            DataType::Int16 => update_sum(as_primitive_array::<Int16Type>(values), running_sum)?,
-            DataType::Int8 => update_sum(as_primitive_array::<Int8Type>(values), running_sum)?,
-            _ => {
-                return Err(DataFusionError::Internal(format!(
-                    "unsupported data type: {:?}",
-                    values.data_type()
-                )));
-            }
-        };
-        self.sum = Some(sum);
+        let array64 = arrow::compute::cast(values, &DataType::Int64)?;
+        let int64_array = array64.as_primitive::<Int64Type>();
+
+        if let Some(batch_sum) = arrow::compute::sum(int64_array) {
+            let running_sum = self.sum.unwrap_or(0);
+            self.sum = Some(running_sum.add_wrapping(batch_sum));
+        }
         Ok(())
     }
 
@@ -187,44 +157,23 @@ impl SumIntegerAccumulatorAnsi {
 
 impl Accumulator for SumIntegerAccumulatorAnsi {
     fn update_batch(&mut self, values: &[ArrayRef]) -> DFResult<()> {
-        fn update_sum<T>(int_array: &PrimitiveArray<T>, mut sum: i64) -> DFResult<i64>
-        where
-            T: ArrowPrimitiveType,
-        {
-            for i in 0..int_array.len() {
-                if !int_array.is_null(i) {
-                    let v = int_array.value(i).to_i64().ok_or_else(|| {
-                        DataFusionError::Internal(format!(
-                            "Failed to convert value {:?} to i64",
-                            int_array.value(i)
-                        ))
-                    })?;
-                    sum = v
-                        .add_checked(sum)
-                        .map_err(|_| DataFusionError::from(arithmetic_overflow_error("integer")))?;
-                }
-            }
-            Ok(sum)
-        }
-
         let values = &values[0];
         if values.len() == values.null_count() {
             return Ok(());
         }
 
-        let running_sum = self.sum.unwrap_or(0);
-        let sum = match values.data_type() {
-            DataType::Int64 => update_sum(as_primitive_array::<Int64Type>(values), running_sum)?,
-            DataType::Int32 => update_sum(as_primitive_array::<Int32Type>(values), running_sum)?,
-            DataType::Int16 => update_sum(as_primitive_array::<Int16Type>(values), running_sum)?,
-            DataType::Int8 => update_sum(as_primitive_array::<Int8Type>(values), running_sum)?,
-            _ => {
-                return Err(DataFusionError::Internal(format!(
-                    "unsupported data type: {:?}",
-                    values.data_type()
-                )));
+        let array64 = arrow::compute::cast(values, &DataType::Int64)?;
+        let int64_array = array64.as_primitive::<Int64Type>();
+
+        let mut sum = self.sum.unwrap_or(0);
+        for i in 0..int64_array.len() {
+            if !int64_array.is_null(i) {
+                let v = int64_array.value(i);
+                sum = v
+                    .add_checked(sum)
+                    .map_err(|_| DataFusionError::from(arithmetic_overflow_error("long")))?;
             }
-        };
+        }
         self.sum = Some(sum);
         Ok(())
     }
@@ -269,28 +218,6 @@ impl SumIntegerAccumulatorTry {
 
 impl Accumulator for SumIntegerAccumulatorTry {
     fn update_batch(&mut self, values: &[ArrayRef]) -> DFResult<()> {
-        /// Returns Ok(Some(sum)) on success, Ok(None) on overflow
-        fn update_sum<T>(int_array: &PrimitiveArray<T>, mut sum: i64) -> DFResult<Option<i64>>
-        where
-            T: ArrowPrimitiveType,
-        {
-            for i in 0..int_array.len() {
-                if !int_array.is_null(i) {
-                    let v = int_array.value(i).to_i64().ok_or_else(|| {
-                        DataFusionError::Internal(format!(
-                            "Failed to convert value {:?} to i64",
-                            int_array.value(i)
-                        ))
-                    })?;
-                    match v.add_checked(sum) {
-                        Ok(new_sum) => sum = new_sum,
-                        Err(_) => return Ok(None),
-                    }
-                }
-            }
-            Ok(Some(sum))
-        }
-
         // Skip if we already saw an overflow
         if self.overflowed() {
             return Ok(());
@@ -301,20 +228,24 @@ impl Accumulator for SumIntegerAccumulatorTry {
             return Ok(());
         }
 
-        let running_sum = self.sum.unwrap_or(0);
-        let sum = match values.data_type() {
-            DataType::Int64 => update_sum(as_primitive_array::<Int64Type>(values), running_sum)?,
-            DataType::Int32 => update_sum(as_primitive_array::<Int32Type>(values), running_sum)?,
-            DataType::Int16 => update_sum(as_primitive_array::<Int16Type>(values), running_sum)?,
-            DataType::Int8 => update_sum(as_primitive_array::<Int8Type>(values), running_sum)?,
-            _ => {
-                return Err(DataFusionError::Internal(format!(
-                    "unsupported data type: {:?}",
-                    values.data_type()
-                )));
+        let array64 = arrow::compute::cast(values, &DataType::Int64)?;
+        let int64_array = array64.as_primitive::<Int64Type>();
+
+        let mut sum = self.sum.unwrap_or(0);
+        for i in 0..int64_array.len() {
+            if !int64_array.is_null(i) {
+                let v = int64_array.value(i);
+                match v.add_checked(sum) {
+                    Ok(new_sum) => sum = new_sum,
+                    Err(_) => {
+                        self.sum = None;
+                        self.has_all_nulls = false;
+                        return Ok(());
+                    }
+                }
             }
-        };
-        self.sum = sum;
+        }
+        self.sum = Some(sum);
         self.has_all_nulls = false;
         Ok(())
     }
@@ -408,67 +339,23 @@ impl GroupsAccumulator for SumIntGroupsAccumulatorLegacy {
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
     ) -> DFResult<()> {
-        fn update_groups_sum<T>(
-            int_array: &PrimitiveArray<T>,
-            group_indices: &[usize],
-            sums: &mut [Option<i64>],
-            opt_filter: Option<&BooleanArray>,
-        ) -> DFResult<()>
-        where
-            T: ArrowPrimitiveType,
-            T::Native: ArrowNativeType,
-        {
-            for (i, &group_index) in group_indices.iter().enumerate() {
-                if let Some(f) = opt_filter {
-                    if !f.is_valid(i) || !f.value(i) {
-                        continue;
-                    }
-                }
-                if !int_array.is_null(i) {
-                    let v = int_array.value(i).to_i64().ok_or_else(|| {
-                        DataFusionError::Internal("Failed to convert value to i64".to_string())
-                    })?;
-                    sums[group_index] = Some(sums[group_index].unwrap_or(0).add_wrapping(v));
-                }
-            }
-            Ok(())
-        }
-
         let values = &values[0];
         self.sums.resize(total_num_groups, None);
 
-        match values.data_type() {
-            DataType::Int64 => update_groups_sum(
-                as_primitive_array::<Int64Type>(values),
-                group_indices,
-                &mut self.sums,
-                opt_filter,
-            )?,
-            DataType::Int32 => update_groups_sum(
-                as_primitive_array::<Int32Type>(values),
-                group_indices,
-                &mut self.sums,
-                opt_filter,
-            )?,
-            DataType::Int16 => update_groups_sum(
-                as_primitive_array::<Int16Type>(values),
-                group_indices,
-                &mut self.sums,
-                opt_filter,
-            )?,
-            DataType::Int8 => update_groups_sum(
-                as_primitive_array::<Int8Type>(values),
-                group_indices,
-                &mut self.sums,
-                opt_filter,
-            )?,
-            _ => {
-                return Err(DataFusionError::Internal(format!(
-                    "Unsupported data type for SumIntGroupsAccumulatorLegacy: {:?}",
-                    values.data_type()
-                )))
+        let array64 = arrow::compute::cast(values, &DataType::Int64)?;
+        let int64_array = array64.as_primitive::<Int64Type>();
+
+        for (i, &group_index) in group_indices.iter().enumerate() {
+            if let Some(f) = opt_filter {
+                if !f.is_valid(i) || !f.value(i) {
+                    continue;
+                }
             }
-        };
+            if !int64_array.is_null(i) {
+                let v = int64_array.value(i);
+                self.sums[group_index] = Some(self.sums[group_index].unwrap_or(0).add_wrapping(v));
+            }
+        }
         Ok(())
     }
 
@@ -552,70 +439,28 @@ impl GroupsAccumulator for SumIntGroupsAccumulatorAnsi {
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
     ) -> DFResult<()> {
-        fn update_groups_sum<T>(
-            int_array: &PrimitiveArray<T>,
-            group_indices: &[usize],
-            sums: &mut [Option<i64>],
-            opt_filter: Option<&BooleanArray>,
-        ) -> DFResult<()>
-        where
-            T: ArrowPrimitiveType,
-            T::Native: ArrowNativeType,
-        {
-            for (i, &group_index) in group_indices.iter().enumerate() {
-                if let Some(f) = opt_filter {
-                    if !f.is_valid(i) || !f.value(i) {
-                        continue;
-                    }
-                }
-                if !int_array.is_null(i) {
-                    let v = int_array.value(i).to_i64().ok_or_else(|| {
-                        DataFusionError::Internal("Failed to convert value to i64".to_string())
-                    })?;
-                    sums[group_index] =
-                        Some(sums[group_index].unwrap_or(0).add_checked(v).map_err(|_| {
-                            DataFusionError::from(arithmetic_overflow_error("integer"))
-                        })?);
-                }
-            }
-            Ok(())
-        }
-
         let values = &values[0];
         self.sums.resize(total_num_groups, None);
 
-        match values.data_type() {
-            DataType::Int64 => update_groups_sum(
-                as_primitive_array::<Int64Type>(values),
-                group_indices,
-                &mut self.sums,
-                opt_filter,
-            )?,
-            DataType::Int32 => update_groups_sum(
-                as_primitive_array::<Int32Type>(values),
-                group_indices,
-                &mut self.sums,
-                opt_filter,
-            )?,
-            DataType::Int16 => update_groups_sum(
-                as_primitive_array::<Int16Type>(values),
-                group_indices,
-                &mut self.sums,
-                opt_filter,
-            )?,
-            DataType::Int8 => update_groups_sum(
-                as_primitive_array::<Int8Type>(values),
-                group_indices,
-                &mut self.sums,
-                opt_filter,
-            )?,
-            _ => {
-                return Err(DataFusionError::Internal(format!(
-                    "Unsupported data type for SumIntGroupsAccumulatorAnsi: {:?}",
-                    values.data_type()
-                )))
+        let array64 = arrow::compute::cast(values, &DataType::Int64)?;
+        let int64_array = array64.as_primitive::<Int64Type>();
+
+        for (i, &group_index) in group_indices.iter().enumerate() {
+            if let Some(f) = opt_filter {
+                if !f.is_valid(i) || !f.value(i) {
+                    continue;
+                }
             }
-        };
+            if !int64_array.is_null(i) {
+                let v = int64_array.value(i);
+                self.sums[group_index] = Some(
+                    self.sums[group_index]
+                        .unwrap_or(0)
+                        .add_checked(v)
+                        .map_err(|_| DataFusionError::from(arithmetic_overflow_error("long")))?,
+                );
+            }
+        }
         Ok(())
     }
 
@@ -673,7 +518,7 @@ impl GroupsAccumulator for SumIntGroupsAccumulatorAnsi {
                     self.sums[group_index]
                         .unwrap()
                         .add_checked(that_sum)
-                        .map_err(|_| DataFusionError::from(arithmetic_overflow_error("integer")))?,
+                        .map_err(|_| DataFusionError::from(arithmetic_overflow_error("long")))?,
                 );
             }
         }
@@ -711,80 +556,31 @@ impl GroupsAccumulator for SumIntGroupsAccumulatorTry {
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
     ) -> DFResult<()> {
-        fn update_groups_sum<T>(
-            int_array: &PrimitiveArray<T>,
-            group_indices: &[usize],
-            sums: &mut [Option<i64>],
-            has_all_nulls: &mut [bool],
-            opt_filter: Option<&BooleanArray>,
-        ) -> DFResult<()>
-        where
-            T: ArrowPrimitiveType,
-            T::Native: ArrowNativeType,
-        {
-            for (i, &group_index) in group_indices.iter().enumerate() {
-                if let Some(f) = opt_filter {
-                    if !f.is_valid(i) || !f.value(i) {
-                        continue;
-                    }
-                }
-                if !int_array.is_null(i) {
-                    // Skip if this group already overflowed
-                    if !has_all_nulls[group_index] && sums[group_index].is_none() {
-                        continue;
-                    }
-                    let v = int_array.value(i).to_i64().ok_or_else(|| {
-                        DataFusionError::Internal("Failed to convert value to i64".to_string())
-                    })?;
-                    match sums[group_index].unwrap_or(0).add_checked(v) {
-                        Ok(new_sum) => sums[group_index] = Some(new_sum),
-                        Err(_) => sums[group_index] = None,
-                    };
-                    has_all_nulls[group_index] = false;
-                }
-            }
-            Ok(())
-        }
         let values = &values[0];
         self.sums.resize(total_num_groups, Some(0));
         self.has_all_nulls.resize(total_num_groups, true);
 
-        match values.data_type() {
-            DataType::Int64 => update_groups_sum(
-                as_primitive_array::<Int64Type>(values),
-                group_indices,
-                &mut self.sums,
-                &mut self.has_all_nulls,
-                opt_filter,
-            )?,
-            DataType::Int32 => update_groups_sum(
-                as_primitive_array::<Int32Type>(values),
-                group_indices,
-                &mut self.sums,
-                &mut self.has_all_nulls,
-                opt_filter,
-            )?,
-            DataType::Int16 => update_groups_sum(
-                as_primitive_array::<Int16Type>(values),
-                group_indices,
-                &mut self.sums,
-                &mut self.has_all_nulls,
-                opt_filter,
-            )?,
-            DataType::Int8 => update_groups_sum(
-                as_primitive_array::<Int8Type>(values),
-                group_indices,
-                &mut self.sums,
-                &mut self.has_all_nulls,
-                opt_filter,
-            )?,
-            _ => {
-                return Err(DataFusionError::Internal(format!(
-                    "Unsupported data type for SumIntGroupsAccumulatorTry: {:?}",
-                    values.data_type()
-                )))
+        let array64 = arrow::compute::cast(values, &DataType::Int64)?;
+        let int64_array = array64.as_primitive::<Int64Type>();
+
+        for (i, &group_index) in group_indices.iter().enumerate() {
+            if let Some(f) = opt_filter {
+                if !f.is_valid(i) || !f.value(i) {
+                    continue;
+                }
             }
-        };
+            if !int64_array.is_null(i) {
+                if !self.has_all_nulls[group_index] && self.sums[group_index].is_none() {
+                    continue;
+                }
+                let v = int64_array.value(i);
+                match self.sums[group_index].unwrap_or(0).add_checked(v) {
+                    Ok(new_sum) => self.sums[group_index] = Some(new_sum),
+                    Err(_) => self.sums[group_index] = None,
+                };
+                self.has_all_nulls[group_index] = false;
+            }
+        }
         Ok(())
     }
 
@@ -1010,5 +806,51 @@ mod tests {
         ]));
         acc.merge_batch(&[states]).unwrap();
         assert_eq!(acc.evaluate().unwrap(), ScalarValue::Int64(Some(60)));
+    }
+
+    #[test]
+    fn test_legacy_accumulator_batch_overflow() {
+        let mut acc = SumIntegerAccumulatorLegacy::new();
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![i64::MAX, 1]));
+        acc.update_batch(&[values]).unwrap();
+        assert_eq!(acc.evaluate().unwrap(), ScalarValue::Int64(Some(i64::MIN)));
+    }
+
+    #[test]
+    fn test_ansi_accumulator_transient_overflow_errors() {
+        let mut acc = SumIntegerAccumulatorAnsi::new();
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![i64::MAX, 1, -1]));
+        assert!(acc.update_batch(&[values]).is_err());
+    }
+
+    #[test]
+    fn test_try_accumulator_transient_overflow_returns_null() {
+        let mut acc = SumIntegerAccumulatorTry::new();
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![i64::MAX, 1, -1]));
+        acc.update_batch(&[values]).unwrap();
+        assert_eq!(acc.evaluate().unwrap(), ScalarValue::Int64(None));
+    }
+
+    #[test]
+    fn test_multi_type_integer_accumulation() {
+        use arrow::array::{Int16Array, Int32Array, Int8Array};
+
+        // Int8
+        let mut acc8 = SumIntegerAccumulatorLegacy::new();
+        let val8: ArrayRef = Arc::new(Int8Array::from(vec![10i8, 20i8]));
+        acc8.update_batch(&[val8]).unwrap();
+        assert_eq!(acc8.evaluate().unwrap(), ScalarValue::Int64(Some(30)));
+
+        // Int16
+        let mut acc16 = SumIntegerAccumulatorLegacy::new();
+        let val16: ArrayRef = Arc::new(Int16Array::from(vec![100i16, 200i16]));
+        acc16.update_batch(&[val16]).unwrap();
+        assert_eq!(acc16.evaluate().unwrap(), ScalarValue::Int64(Some(300)));
+
+        // Int32
+        let mut acc32 = SumIntegerAccumulatorLegacy::new();
+        let val32: ArrayRef = Arc::new(Int32Array::from(vec![1000i32, 2000i32]));
+        acc32.update_batch(&[val32]).unwrap();
+        assert_eq!(acc32.evaluate().unwrap(), ScalarValue::Int64(Some(3000)));
     }
 }
