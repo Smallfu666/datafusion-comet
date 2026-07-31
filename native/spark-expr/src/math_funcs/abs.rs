@@ -95,7 +95,7 @@ pub fn abs(args: &[ColumnarValue]) -> Result<ColumnarValue, DataFusionError> {
                     let result = legacy_compute_op!(array, wrapping_abs, Int8Array, Int8Array);
                     Ok(ColumnarValue::Array(Arc::new(result?)))
                 } else {
-                    ansi_compute_op!(array, abs, Int8Array, Int8Type, i8, "Int8")
+                    ansi_compute_op!(array, abs, Int8Array, Int8Type, i8, "byte")
                 }
             }
             DataType::Int16 => {
@@ -103,7 +103,7 @@ pub fn abs(args: &[ColumnarValue]) -> Result<ColumnarValue, DataFusionError> {
                     let result = legacy_compute_op!(array, wrapping_abs, Int16Array, Int16Array);
                     Ok(ColumnarValue::Array(Arc::new(result?)))
                 } else {
-                    ansi_compute_op!(array, abs, Int16Array, Int16Type, i16, "Int16")
+                    ansi_compute_op!(array, abs, Int16Array, Int16Type, i16, "short")
                 }
             }
             DataType::Int32 => {
@@ -111,7 +111,7 @@ pub fn abs(args: &[ColumnarValue]) -> Result<ColumnarValue, DataFusionError> {
                     let result = legacy_compute_op!(array, wrapping_abs, Int32Array, Int32Array);
                     Ok(ColumnarValue::Array(Arc::new(result?)))
                 } else {
-                    ansi_compute_op!(array, abs, Int32Array, Int32Type, i32, "Int32")
+                    ansi_compute_op!(array, abs, Int32Array, Int32Type, i32, "integer")
                 }
             }
             DataType::Int64 => {
@@ -119,7 +119,7 @@ pub fn abs(args: &[ColumnarValue]) -> Result<ColumnarValue, DataFusionError> {
                     let result = legacy_compute_op!(array, wrapping_abs, Int64Array, Int64Array);
                     Ok(ColumnarValue::Array(Arc::new(result?)))
                 } else {
-                    ansi_compute_op!(array, abs, Int64Array, Int64Type, i64, "Int64")
+                    ansi_compute_op!(array, abs, Int64Array, Int64Type, i64, "long")
                 }
             }
             DataType::Float32 => {
@@ -143,7 +143,7 @@ pub fn abs(args: &[ColumnarValue]) -> Result<ColumnarValue, DataFusionError> {
                         Some(i) => {
                             match arrow::compute::kernels::arity::try_unary(i, |x| {
                                 if x == i128::MIN {
-                                    Err(ArrowError::ArithmeticOverflow("Decimal128".to_string()))
+                                    Err(ArrowError::ArithmeticOverflow("decimal".to_string()))
                                 } else {
                                     Ok(x.abs())
                                 }
@@ -153,7 +153,7 @@ pub fn abs(args: &[ColumnarValue]) -> Result<ColumnarValue, DataFusionError> {
                                 >::new(
                                     res.with_data_type(DataType::Decimal128(*precision, *scale)),
                                 ))),
-                                Err(_) => Err(arithmetic_overflow_error("Decimal128").into()),
+                                Err(_) => Err(arithmetic_overflow_error("decimal").into()),
                             }
                         }
                         _ => Err(DataFusionError::Internal("Invalid data type".to_string())),
@@ -173,7 +173,7 @@ pub fn abs(args: &[ColumnarValue]) -> Result<ColumnarValue, DataFusionError> {
                         Some(i) => {
                             match arrow::compute::kernels::arity::try_unary(i, |x| {
                                 if x == i256::MIN {
-                                    Err(ArrowError::ArithmeticOverflow("Decimal256".to_string()))
+                                    Err(ArrowError::ArithmeticOverflow("decimal".to_string()))
                                 } else {
                                     Ok(x.wrapping_abs()) // i256 doesn't define abs() method
                                 }
@@ -183,7 +183,7 @@ pub fn abs(args: &[ColumnarValue]) -> Result<ColumnarValue, DataFusionError> {
                                 >::new(
                                     res.with_data_type(DataType::Decimal256(*precision, *scale)),
                                 ))),
-                                Err(_) => Err(arithmetic_overflow_error("Decimal256").into()),
+                                Err(_) => Err(arithmetic_overflow_error("decimal").into()),
                             }
                         }
                         _ => Err(DataFusionError::Internal("Invalid data type".to_string())),
@@ -207,7 +207,7 @@ pub fn abs(args: &[ColumnarValue]) -> Result<ColumnarValue, DataFusionError> {
                             // return the original value
                             Ok(ColumnarValue::Scalar(ScalarValue::Int8(Some(*v))))
                         } else {
-                            Err(arithmetic_overflow_error("Int8").into())
+                            Err(arithmetic_overflow_error("byte").into())
                         }
                     }
                 },
@@ -221,7 +221,7 @@ pub fn abs(args: &[ColumnarValue]) -> Result<ColumnarValue, DataFusionError> {
                             // return the original value
                             Ok(ColumnarValue::Scalar(ScalarValue::Int16(Some(*v))))
                         } else {
-                            Err(arithmetic_overflow_error("Int16").into())
+                            Err(arithmetic_overflow_error("short").into())
                         }
                     }
                 },
@@ -235,7 +235,7 @@ pub fn abs(args: &[ColumnarValue]) -> Result<ColumnarValue, DataFusionError> {
                             // return the original value
                             Ok(ColumnarValue::Scalar(ScalarValue::Int32(Some(*v))))
                         } else {
-                            Err(arithmetic_overflow_error("Int32").into())
+                            Err(arithmetic_overflow_error("integer").into())
                         }
                     }
                 },
@@ -249,7 +249,7 @@ pub fn abs(args: &[ColumnarValue]) -> Result<ColumnarValue, DataFusionError> {
                             // return the original value
                             Ok(ColumnarValue::Scalar(ScalarValue::Int64(Some(*v))))
                         } else {
-                            Err(arithmetic_overflow_error("Int64").into())
+                            Err(arithmetic_overflow_error("long").into())
                         }
                     }
                 },
@@ -277,7 +277,7 @@ pub fn abs(args: &[ColumnarValue]) -> Result<ColumnarValue, DataFusionError> {
                                 *scale,
                             )))
                         } else {
-                            Err(arithmetic_overflow_error("Decimal128").into())
+                            Err(arithmetic_overflow_error("decimal").into())
                         }
                     }
                 },
@@ -299,7 +299,7 @@ pub fn abs(args: &[ColumnarValue]) -> Result<ColumnarValue, DataFusionError> {
                                 *scale,
                             )))
                         } else {
-                            Err(arithmetic_overflow_error("Decimal256").into())
+                            Err(arithmetic_overflow_error("decimal").into())
                         }
                     }
                 },

@@ -16,7 +16,6 @@
 // under the License.
 
 use crate::arithmetic_overflow_error;
-use crate::SparkError;
 use arrow::array::RecordBatch;
 use arrow::datatypes::IntervalDayTime;
 use arrow::datatypes::{DataType, Schema};
@@ -154,10 +153,10 @@ impl PhysicalExpr for NegativeExpr {
                 if self.fail_on_error {
                     match scalar {
                         ScalarValue::Int8(Some(i8::MIN)) => {
-                            return Err(arithmetic_overflow_error(" caused").into());
+                            return Err(arithmetic_overflow_error("byte").into());
                         }
                         ScalarValue::Int16(Some(i16::MIN)) => {
-                            return Err(arithmetic_overflow_error(" caused").into());
+                            return Err(arithmetic_overflow_error("short").into());
                         }
                         ScalarValue::Int32(Some(i32::MIN)) => {
                             return Err(arithmetic_overflow_error("integer").into());
@@ -224,10 +223,7 @@ impl PhysicalExpr for NegativeExpr {
             || child_interval.lower() == &ScalarValue::Int64(Some(i64::MIN))
             || child_interval.upper() == &ScalarValue::Int64(Some(i64::MIN))
         {
-            return Err(SparkError::ArithmeticOverflow {
-                from_type: "long".to_string(),
-            }
-            .into());
+            return Err(arithmetic_overflow_error("long").into());
         }
 
         let negated_interval = Interval::try_new(

@@ -67,7 +67,10 @@ pub enum SparkError {
     CannotParseDecimal,
 
     #[error("[ARITHMETIC_OVERFLOW] {from_type} overflow. If necessary set \"spark.sql.ansi.enabled\" to \"false\" to bypass this error.")]
-    ArithmeticOverflow { from_type: String },
+    ArithmeticOverflow {
+        from_type: String,
+        function_name: Option<String>,
+    },
 
     #[error("[ARITHMETIC_OVERFLOW] Overflow in integral divide. Use 'try_divide' to tolerate overflow and return NULL instead. If necessary set \"spark.sql.ansi.enabled\" to \"false\" to bypass this error.")]
     IntegralDivideOverflow,
@@ -358,10 +361,16 @@ impl SparkError {
                     "toType": to_type,
                 })
             }
-            SparkError::ArithmeticOverflow { from_type } => {
-                serde_json::json!({
-                    "fromType": from_type,
-                })
+            SparkError::ArithmeticOverflow {
+                from_type,
+                function_name,
+            } => {
+                let mut map = serde_json::Map::new();
+                map.insert("fromType".to_string(), serde_json::json!(from_type));
+                if let Some(f) = function_name {
+                    map.insert("functionName".to_string(), serde_json::json!(f));
+                }
+                serde_json::Value::Object(map)
             }
             SparkError::DecimalSumOverflow { function_name } => {
                 serde_json::json!({

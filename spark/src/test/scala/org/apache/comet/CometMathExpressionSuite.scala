@@ -75,6 +75,98 @@ class CometMathExpressionSuite extends CometTestBase with AdaptiveSparkPlanHelpe
     }
   }
 
+  test("ANSI arithmetic overflow error class and message parity (#5071)") {
+    withSQLConf(SQLConf.ANSI_ENABLED.key -> "true") {
+      // Byte add overflow
+      val excByteAdd = intercept[Exception] {
+        spark.sql("SELECT CAST(127 AS BYTE) + CAST(1 AS BYTE)").collect()
+      }
+      assert(excByteAdd.getMessage.contains("BINARY_ARITHMETIC_OVERFLOW"))
+      assert(excByteAdd.getMessage.contains("127"))
+
+      // Byte sub overflow
+      val excByteSub = intercept[Exception] {
+        spark.sql("SELECT CAST(-128 AS BYTE) - CAST(1 AS BYTE)").collect()
+      }
+      assert(excByteSub.getMessage.contains("BINARY_ARITHMETIC_OVERFLOW"))
+      assert(excByteSub.getMessage.contains("-128"))
+
+      // Byte mul overflow
+      val excByteMul = intercept[Exception] {
+        spark.sql("SELECT CAST(100 AS BYTE) * CAST(2 AS BYTE)").collect()
+      }
+      assert(excByteMul.getMessage.contains("BINARY_ARITHMETIC_OVERFLOW"))
+      assert(excByteMul.getMessage.contains("100"))
+
+      // Short add overflow
+      val excShortAdd = intercept[Exception] {
+        spark.sql("SELECT CAST(32767 AS SHORT) + CAST(1 AS SHORT)").collect()
+      }
+      assert(excShortAdd.getMessage.contains("BINARY_ARITHMETIC_OVERFLOW"))
+      assert(excShortAdd.getMessage.contains("32767"))
+
+      // Short sub overflow
+      val excShortSub = intercept[Exception] {
+        spark.sql("SELECT CAST(-32768 AS SHORT) - CAST(1 AS SHORT)").collect()
+      }
+      assert(excShortSub.getMessage.contains("BINARY_ARITHMETIC_OVERFLOW"))
+      assert(excShortSub.getMessage.contains("-32768"))
+
+      // Short mul overflow
+      val excShortMul = intercept[Exception] {
+        spark.sql("SELECT CAST(20000 AS SHORT) * CAST(2 AS SHORT)").collect()
+      }
+      assert(excShortMul.getMessage.contains("BINARY_ARITHMETIC_OVERFLOW"))
+      assert(excShortMul.getMessage.contains("20000"))
+
+      // Int add overflow
+      val excIntAdd = intercept[Exception] {
+        spark.sql("SELECT CAST(2147483647 AS INT) + CAST(1 AS INT)").collect()
+      }
+      assert(excIntAdd.getMessage.contains("ARITHMETIC_OVERFLOW"))
+      assert(excIntAdd.getMessage.contains("integer overflow"))
+
+      // Long add overflow
+      val excLongAdd = intercept[Exception] {
+        spark.sql("SELECT 9223372036854775807L + 1L").collect()
+      }
+      assert(excLongAdd.getMessage.contains("ARITHMETIC_OVERFLOW"))
+      assert(excLongAdd.getMessage.contains("long overflow"))
+
+      // UnaryMinus Byte & Short
+      val excUnaryByte = intercept[Exception] {
+        spark.sql("SELECT - CAST(-128 AS BYTE)").collect()
+      }
+      assert(excUnaryByte.getMessage.contains("-128"))
+
+      val excUnaryShort = intercept[Exception] {
+        spark.sql("SELECT - CAST(-32768 AS SHORT)").collect()
+      }
+      assert(excUnaryShort.getMessage.contains("-32768"))
+
+      // Abs Byte, Short, Int, Long
+      val excAbsByte = intercept[Exception] {
+        spark.sql("SELECT abs(CAST(-128 AS BYTE))").collect()
+      }
+      assert(excAbsByte.getMessage.contains("byte"))
+
+      val excAbsShort = intercept[Exception] {
+        spark.sql("SELECT abs(CAST(-32768 AS SHORT))").collect()
+      }
+      assert(excAbsShort.getMessage.contains("short"))
+
+      val excAbsInt = intercept[Exception] {
+        spark.sql("SELECT abs(CAST(-2147483648 AS INT))").collect()
+      }
+      assert(excAbsInt.getMessage.contains("integer"))
+
+      val excAbsLong = intercept[Exception] {
+        spark.sql("SELECT abs(CAST(-9223372036854775808L AS LONG))").collect()
+      }
+      assert(excAbsLong.getMessage.contains("long"))
+    }
+  }
+
   private def createTestData(generateNegativeZero: Boolean) = {
     val r = new Random(42)
     val schema = StructType(

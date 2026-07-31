@@ -113,9 +113,14 @@ trait ShimSparkErrorConverter {
 
       case "ArithmeticOverflow" =>
         val fromType = params("fromType").toString
+        val hint = params.get("functionName") match {
+          case Some(fn: String) if fn.nonEmpty =>
+            s"Use `$fn` to tolerate overflow and return NULL instead."
+          case _ => ""
+        }
         Some(
           QueryExecutionErrors
-            .arithmeticOverflowError(fromType + " overflow", "", context.headOption.orNull))
+            .arithmeticOverflowError(fromType + " overflow", hint, context.headOption.orNull))
 
       case "IntegralDivideOverflow" =>
         Some(QueryExecutionErrors.overflowInIntegralDivideError(context.headOption.orNull))

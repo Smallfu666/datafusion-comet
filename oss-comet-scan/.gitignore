@@ -1,0 +1,10 @@
+.DS_Store
+local-env.md
+**/local-env.md
+artifacts/
+logs/
+source/
+worktrees/
+*.log
+*.trace
+*.profraw

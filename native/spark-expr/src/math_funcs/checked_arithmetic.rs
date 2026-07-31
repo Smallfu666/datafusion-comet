@@ -18,7 +18,7 @@
 use arrow::array::{Array, ArrowNativeTypeOp, BooleanBufferBuilder, PrimitiveArray};
 use arrow::array::{ArrayRef, AsArray};
 
-use crate::{divide_by_zero_error, EvalMode, SparkError};
+use crate::{arithmetic_overflow_error_with_supp, divide_by_zero_error, EvalMode, SparkError};
 use arrow::buffer::NullBuffer;
 use arrow::datatypes::{
     ArrowPrimitiveType, DataType, Float16Type, Float32Type, Float64Type, Int16Type, Int32Type,
@@ -34,44 +34,64 @@ pub fn try_arithmetic_kernel<T>(
     right: &PrimitiveArray<T>,
     op: &str,
     is_ansi_mode: bool,
+    type_name: &str,
+    is_binary_overflow: bool,
 ) -> Result<ArrayRef, DataFusionError>
 where
     T: ArrowPrimitiveType,
+    T::Native: std::fmt::Display,
 {
-    match op {
-        "checked_add" => checked_binary(left, right, is_ansi_mode, false, |l, r| l.add_checked(r)),
-        "checked_sub" => checked_binary(left, right, is_ansi_mode, false, |l, r| l.sub_checked(r)),
-        "checked_mul" => checked_binary(left, right, is_ansi_mode, false, |l, r| l.mul_checked(r)),
-        "checked_div" => checked_binary(left, right, is_ansi_mode, true, |l, r| l.div_checked(r)),
-        _ => Err(DataFusionError::Internal(format!(
-            "Unsupported operation: {:?}",
-            op
-        ))),
-    }
+    let (symbol, fn_name, is_div) = match op {
+        "checked_add" => ("+", "try_add", false),
+        "checked_sub" => ("-", "try_subtract", false),
+        "checked_mul" => ("*", "try_multiply", false),
+        "checked_div" => ("/", "try_divide", true),
+        _ => {
+            return Err(DataFusionError::Internal(format!(
+                "Unsupported operation: {:?}",
+                op
+            )))
+        }
+    };
+
+    let func = |l: T::Native, r: T::Native| match op {
+        "checked_add" => l.add_checked(r),
+        "checked_sub" => l.sub_checked(r),
+        "checked_mul" => l.mul_checked(r),
+        "checked_div" => l.div_checked(r),
+        _ => unreachable!(),
+    };
+
+    checked_binary(
+        left,
+        right,
+        type_name,
+        symbol,
+        fn_name,
+        is_binary_overflow,
+        is_ansi_mode,
+        is_div,
+        func,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn checked_binary<T, F>(
     left: &PrimitiveArray<T>,
     right: &PrimitiveArray<T>,
+    type_name: &str,
+    symbol: &str,
+    fn_name: &str,
+    is_binary_overflow: bool,
     is_ansi_mode: bool,
     is_div: bool,
     op: F,
 ) -> Result<ArrayRef, DataFusionError>
 where
     T: ArrowPrimitiveType,
+    T::Native: std::fmt::Display,
     F: Fn(T::Native, T::Native) -> Result<T::Native, ArrowError>,
 {
-    if is_ansi_mode {
-        return arrow::compute::kernels::arity::try_binary::<_, _, _, T>(left, right, op)
-            .map(|array| Arc::new(array) as ArrayRef)
-            .map_err(|e| match e {
-                ArrowError::DivideByZero => divide_by_zero_error().into(),
-                _ => DataFusionError::from(SparkError::ArithmeticOverflow {
-                    from_type: String::from("integer"),
-                }),
-            });
-    }
-
     let len = left.len();
     let lhs = &left.values()[..len];
     let rhs = &right.values()[..len];
@@ -81,19 +101,29 @@ where
     let mut overflowed: Vec<usize> = Vec::new();
 
     for (i, (out, (&l, &r))) in values.iter_mut().zip(lhs.iter().zip(rhs)).enumerate() {
+        if let Some(ref n) = nulls {
+            if !n.is_valid(i) {
+                continue;
+            }
+        }
         match op(l, r) {
             Ok(v) => *out = v,
             Err(_) => {
                 if !is_ansi_mode {
                     overflowed.push(i);
-                } else if nulls.as_ref().is_none_or(|n| n.is_valid(i)) {
+                } else {
                     return if is_div && r.is_zero() {
                         Err(divide_by_zero_error().into())
-                    } else {
-                        Err(SparkError::ArithmeticOverflow {
-                            from_type: String::from("integer"),
+                    } else if is_binary_overflow {
+                        Err(SparkError::BinaryArithmeticOverflow {
+                            value1: l.to_string(),
+                            symbol: symbol.to_string(),
+                            value2: r.to_string(),
+                            function_name: fn_name.to_string(),
                         }
                         .into())
+                    } else {
+                        Err(arithmetic_overflow_error_with_supp(type_name, fn_name).into())
                     };
                 }
             }
@@ -113,16 +143,6 @@ where
         }
         Some(NullBuffer::new(validity.finish()))
     };
-
-    if let Some(n) = &nulls {
-        if n.null_count() > 0 {
-            for (out, valid) in values.iter_mut().zip(n.iter()) {
-                if !valid {
-                    *out = T::Native::default();
-                }
-            }
-        }
-    }
 
     Ok(Arc::new(PrimitiveArray::<T>::new(values.into(), nulls)) as ArrayRef)
 }
@@ -196,24 +216,32 @@ fn checked_arithmetic_internal(
             right_arr.as_primitive::<Int8Type>(),
             op,
             is_ansi_mode,
+            "byte",
+            true,
         ),
         DataType::Int16 => try_arithmetic_kernel::<Int16Type>(
             left_arr.as_primitive::<Int16Type>(),
             right_arr.as_primitive::<Int16Type>(),
             op,
             is_ansi_mode,
+            "short",
+            true,
         ),
         DataType::Int32 => try_arithmetic_kernel::<Int32Type>(
             left_arr.as_primitive::<Int32Type>(),
             right_arr.as_primitive::<Int32Type>(),
             op,
             is_ansi_mode,
+            "integer",
+            false,
         ),
         DataType::Int64 => try_arithmetic_kernel::<Int64Type>(
             left_arr.as_primitive::<Int64Type>(),
             right_arr.as_primitive::<Int64Type>(),
             op,
             is_ansi_mode,
+            "long",
+            false,
         ),
         // Spark always casts division operands to floats
         DataType::Float16 if (op == "checked_div") => try_arithmetic_kernel::<Float16Type>(
@@ -221,18 +249,24 @@ fn checked_arithmetic_internal(
             right_arr.as_primitive::<Float16Type>(),
             op,
             is_ansi_mode,
+            "float",
+            false,
         ),
         DataType::Float32 if (op == "checked_div") => try_arithmetic_kernel::<Float32Type>(
             left_arr.as_primitive::<Float32Type>(),
             right_arr.as_primitive::<Float32Type>(),
             op,
             is_ansi_mode,
+            "float",
+            false,
         ),
         DataType::Float64 if (op == "checked_div") => try_arithmetic_kernel::<Float64Type>(
             left_arr.as_primitive::<Float64Type>(),
             right_arr.as_primitive::<Float64Type>(),
             op,
             is_ansi_mode,
+            "double",
+            false,
         ),
         _ => Err(DataFusionError::Internal(format!(
             "Unsupported data type: {:?}",
@@ -331,5 +365,53 @@ mod tests {
         let result = as_int32(checked_add(&args, &DataType::Int32, EvalMode::Ansi).unwrap());
         assert_eq!(result, Int32Array::from(vec![None, Some(2)]));
         assert_eq!(result.values()[0], 0);
+    }
+
+    #[test]
+    fn test_ansi_overflow_errors() {
+        use arrow::array::{Int16Array, Int64Array, Int8Array};
+
+        // Int8 (Byte) -> BinaryArithmeticOverflow
+        let left8 = ColumnarValue::Array(Arc::new(Int8Array::from(vec![127])));
+        let right8 = ColumnarValue::Array(Arc::new(Int8Array::from(vec![1])));
+        let err8 = checked_add(&[left8, right8], &DataType::Int8, EvalMode::Ansi).unwrap_err();
+        assert!(err8.to_string().contains("[BINARY_ARITHMETIC_OVERFLOW] 127 + 1 caused overflow. Use `try_add` to tolerate overflow"));
+
+        // Int16 (Short) -> BinaryArithmeticOverflow
+        let left16 = ColumnarValue::Array(Arc::new(Int16Array::from(vec![32767])));
+        let right16 = ColumnarValue::Array(Arc::new(Int16Array::from(vec![1])));
+        let err16 = checked_add(&[left16, right16], &DataType::Int16, EvalMode::Ansi).unwrap_err();
+        assert!(err16.to_string().contains("[BINARY_ARITHMETIC_OVERFLOW] 32767 + 1 caused overflow. Use `try_add` to tolerate overflow"));
+
+        // Int32 -> ArithmeticOverflow ("integer")
+        let left32 = ColumnarValue::Array(Arc::new(Int32Array::from(vec![i32::MAX])));
+        let right32 = ColumnarValue::Array(Arc::new(Int32Array::from(vec![1])));
+        let err32 = checked_add(&[left32, right32], &DataType::Int32, EvalMode::Ansi).unwrap_err();
+        assert!(err32
+            .to_string()
+            .contains("[ARITHMETIC_OVERFLOW] integer overflow"));
+
+        // Int64 -> ArithmeticOverflow ("long")
+        let left64 = ColumnarValue::Array(Arc::new(Int64Array::from(vec![i64::MAX])));
+        let right64 = ColumnarValue::Array(Arc::new(Int64Array::from(vec![1])));
+        let err64 = checked_add(&[left64, right64], &DataType::Int64, EvalMode::Ansi).unwrap_err();
+        assert!(err64
+            .to_string()
+            .contains("[ARITHMETIC_OVERFLOW] long overflow"));
+    }
+
+    #[test]
+    fn test_checked_div_null_with_zero_buffer_in_ansi_mode() {
+        let left = Int32Array::from(vec![Some(10), None]);
+        let right_nulls = NullBuffer::from(vec![true, false]);
+        // Slot 1 is null, but its underlying buffer holds 0
+        let right = Int32Array::new(vec![2, 0].into(), Some(right_nulls));
+        let args = vec![
+            ColumnarValue::Array(Arc::new(left)),
+            ColumnarValue::Array(Arc::new(right)),
+        ];
+
+        let result = as_int32(checked_div(&args, &DataType::Int32, EvalMode::Ansi).unwrap());
+        assert_eq!(result, Int32Array::from(vec![Some(5), None]));
     }
 }

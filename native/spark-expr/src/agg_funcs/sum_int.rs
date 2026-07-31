@@ -201,7 +201,7 @@ impl Accumulator for SumIntegerAccumulatorAnsi {
                     })?;
                     sum = v
                         .add_checked(sum)
-                        .map_err(|_| DataFusionError::from(arithmetic_overflow_error("integer")))?;
+                        .map_err(|_| DataFusionError::from(arithmetic_overflow_error("long")))?;
                 }
             }
             Ok(sum)
@@ -574,7 +574,7 @@ impl GroupsAccumulator for SumIntGroupsAccumulatorAnsi {
                     })?;
                     sums[group_index] =
                         Some(sums[group_index].unwrap_or(0).add_checked(v).map_err(|_| {
-                            DataFusionError::from(arithmetic_overflow_error("integer"))
+                            DataFusionError::from(arithmetic_overflow_error("long"))
                         })?);
                 }
             }
@@ -673,7 +673,7 @@ impl GroupsAccumulator for SumIntGroupsAccumulatorAnsi {
                     self.sums[group_index]
                         .unwrap()
                         .add_checked(that_sum)
-                        .map_err(|_| DataFusionError::from(arithmetic_overflow_error("integer")))?,
+                        .map_err(|_| DataFusionError::from(arithmetic_overflow_error("long")))?,
                 );
             }
         }
