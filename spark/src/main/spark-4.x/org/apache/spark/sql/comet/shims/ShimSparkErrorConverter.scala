@@ -119,6 +119,13 @@ trait ShimSparkErrorConverter {
       case "IntegralDivideOverflow" =>
         Some(QueryExecutionErrors.overflowInIntegralDivideError(context.headOption.orNull))
 
+      // Spark's RoundBase reports the JDK ArithmeticException message verbatim, which is the
+      // bare word "Overflow" for every integer width, with no try_ alternative.
+      case "RoundOverflow" =>
+        Some(
+          QueryExecutionErrors
+            .arithmeticOverflowError("Overflow", "", context.headOption.orNull))
+
       case "DecimalSumOverflow" =>
         val functionName = params.get("functionName").map(_.toString).getOrElse("sum")
         Some(

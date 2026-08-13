@@ -21,6 +21,7 @@ package org.apache.comet
 
 import scala.util.Random
 
+import org.apache.spark.SparkThrowable
 import org.apache.spark.sql.CometTestBase
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
 import org.apache.spark.sql.internal.SQLConf
@@ -145,6 +146,46 @@ class CometMathExpressionSuite extends CometTestBase with AdaptiveSparkPlanHelpe
         .createOrReplaceTempView("width_bucket_range")
       checkSparkAnswerAndOperator(
         "SELECT id, width_bucket(value, 0.0, 10.0, 5) FROM width_bucket_range ORDER BY id")
+    }
+  }
+
+  private def causeChain(error: Throwable): Seq[Throwable] =
+    Iterator.iterate(error)(_.getCause).takeWhile(_ != null).toSeq
+
+  private def deepestSparkThrowable(error: Throwable): SparkThrowable with Throwable =
+    causeChain(error)
+      .collect { case e: SparkThrowable with Throwable => e }
+      .lastOption
+      .getOrElse(
+        fail(s"No SparkThrowable in cause chain: ${causeChain(error).map(_.getClass.getName)}"))
+
+  test("round ANSI overflow raises Spark's exception, not a native one") {
+    withSQLConf(
+      SQLConf.ANSI_ENABLED.key -> "true",
+      SQLConf.OPTIMIZER_EXCLUDED_RULES.key ->
+        "org.apache.spark.sql.catalyst.optimizer.ConstantFolding") {
+      Seq(
+        "SELECT round(CAST(2147483645 AS INT), -1)",
+        "SELECT round(CAST(9223372036854775805 AS BIGINT), -1)").foreach { query =>
+        val df = sql(query)
+        checkCometOperators(stripAQEPlan(df.queryExecution.executedPlan))
+
+        val (sparkError, cometError) = checkSparkAnswerMaybeThrows(df)
+        val sparkFailure = sparkError.getOrElse(fail(s"Spark did not fail for: $query"))
+        val cometFailure = cometError.getOrElse(fail(s"Comet did not fail for: $query"))
+        val expected = deepestSparkThrowable(sparkFailure)
+        val actual = deepestSparkThrowable(cometFailure)
+
+        assert(actual.getClass == expected.getClass)
+        assert(actual.getErrorClass == expected.getErrorClass)
+        assert(actual.getSqlState == expected.getSqlState)
+        assert(actual.getMessageParameters == expected.getMessageParameters)
+        // Spark appends a SQL query context that Comet does not carry for this expression, so the
+        // messages agree up to that suffix rather than exactly. Only `Cast`, `CheckOverflow`,
+        // `ListExtract` and `SumDecimal` propagate a context today.
+        assert(expected.getMessage.startsWith(actual.getMessage))
+        assert(!causeChain(cometFailure).exists(_.isInstanceOf[CometNativeException]))
+      }
     }
   }
 }

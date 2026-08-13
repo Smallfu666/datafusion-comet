@@ -72,6 +72,14 @@ pub enum SparkError {
     #[error("[ARITHMETIC_OVERFLOW] Overflow in integral divide. Use 'try_divide' to tolerate overflow and return NULL instead. If necessary set \"spark.sql.ansi.enabled\" to \"false\" to bypass this error.")]
     IntegralDivideOverflow,
 
+    /// Spark's `RoundBase` rounds through `BigDecimal` and converts back with
+    /// `toByteExact`/`toShortExact`/`toIntExact`/`toLongExact`, then `MathUtils.withOverflow`
+    /// passes the JDK `ArithmeticException`'s own message through as the `message` parameter.
+    /// That message is the bare word `Overflow` for every integer width, so this error carries
+    /// no type name.
+    #[error("[ARITHMETIC_OVERFLOW] Overflow. If necessary set \"spark.sql.ansi.enabled\" to \"false\" to bypass this error.")]
+    RoundOverflow,
+
     #[error("[ARITHMETIC_OVERFLOW] Overflow in sum of decimals. Use `try_{function_name}` to tolerate overflow and return NULL instead. If necessary set \"spark.sql.ansi.enabled\" to \"false\" to bypass this error.")]
     DecimalSumOverflow { function_name: String },
 
@@ -270,6 +278,7 @@ impl SparkError {
             SparkError::CannotParseDecimal => "CannotParseDecimal",
             SparkError::ArithmeticOverflow { .. } => "ArithmeticOverflow",
             SparkError::IntegralDivideOverflow => "IntegralDivideOverflow",
+            SparkError::RoundOverflow => "RoundOverflow",
             SparkError::DecimalSumOverflow { .. } => "DecimalSumOverflow",
             SparkError::DivideByZero => "DivideByZero",
             SparkError::RemainderByZero => "RemainderByZero",
@@ -588,6 +597,7 @@ impl SparkError {
             | SparkError::NumericOutOfRange { .. } // Comet-specific extension
             | SparkError::ArithmeticOverflow { .. }
             | SparkError::IntegralDivideOverflow
+            | SparkError::RoundOverflow
             | SparkError::DecimalSumOverflow { .. }
             | SparkError::BinaryArithmeticOverflow { .. }
             | SparkError::IntervalArithmeticOverflowWithSuggestion { .. }
@@ -685,6 +695,7 @@ impl SparkError {
             SparkError::IntervalDividedByZero => Some("INTERVAL_DIVIDED_BY_ZERO"),
             SparkError::ArithmeticOverflow { .. } => Some("ARITHMETIC_OVERFLOW"),
             SparkError::IntegralDivideOverflow => Some("ARITHMETIC_OVERFLOW"),
+            SparkError::RoundOverflow => Some("ARITHMETIC_OVERFLOW"),
             SparkError::DecimalSumOverflow { .. } => Some("ARITHMETIC_OVERFLOW"),
             SparkError::BinaryArithmeticOverflow { .. } => Some("BINARY_ARITHMETIC_OVERFLOW"),
             SparkError::IntervalArithmeticOverflowWithSuggestion { .. } => {

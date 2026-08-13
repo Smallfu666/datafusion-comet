@@ -100,6 +100,11 @@ trait ShimSparkErrorConverter {
       case "IntegralDivideOverflow" =>
         Some(QueryExecutionErrors.overflowInIntegralDivideError(sqlCtx(context)))
 
+      // Spark's RoundBase reports the JDK ArithmeticException message verbatim, which is the
+      // bare word "Overflow" for every integer width, with no try_ alternative.
+      case "RoundOverflow" =>
+        Some(QueryExecutionErrors.arithmeticOverflowError("Overflow", "", sqlCtx(context)))
+
       case "DecimalSumOverflow" =>
         // Spark 3.x takes SQLQueryContext, not QueryContext
         Some(QueryExecutionErrors.overflowInSumOfDecimalError(sqlCtx(context)))

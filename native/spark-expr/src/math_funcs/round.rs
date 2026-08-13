@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::arithmetic_overflow_error;
 use crate::math_funcs::utils::{get_precision_scale, make_decimal_array, make_decimal_scalar};
+use crate::SparkError;
 use arrow::array::{Array, ArrowNativeTypeOp};
 use arrow::array::{Int16Array, Int32Array, Int64Array, Int8Array};
 use arrow::datatypes::{DataType, Field};
@@ -33,25 +33,24 @@ macro_rules! integer_round {
         let rem = $X % $DIV;
         if rem <= -$HALF {
             if $FAIL_ON_ERROR {
-                ($X - rem).sub_checked($DIV).map_err(|_| {
-                    ArrowError::ComputeError(arithmetic_overflow_error("integer").to_string())
-                })
+                ($X - rem)
+                    .sub_checked($DIV)
+                    .map_err(|_| ArrowError::ArithmeticOverflow("Overflow".to_string()))
             } else {
                 Ok(($X - rem).sub_wrapping($DIV))
             }
         } else if rem >= $HALF {
             if $FAIL_ON_ERROR {
-                ($X - rem).add_checked($DIV).map_err(|_| {
-                    ArrowError::ComputeError(arithmetic_overflow_error("integer").to_string())
-                })
+                ($X - rem)
+                    .add_checked($DIV)
+                    .map_err(|_| ArrowError::ArithmeticOverflow("Overflow".to_string()))
             } else {
                 Ok(($X - rem).add_wrapping($DIV))
             }
         } else {
             if $FAIL_ON_ERROR {
-                $X.sub_checked(rem).map_err(|_| {
-                    ArrowError::ComputeError(arithmetic_overflow_error("integer").to_string())
-                })
+                $X.sub_checked(rem)
+                    .map_err(|_| ArrowError::ArithmeticOverflow("Overflow".to_string()))
             } else {
                 Ok($X.sub_wrapping(rem))
             }
@@ -76,27 +75,33 @@ macro_rules! integer_round_widened {
         if x128 > -$HALF && x128 < $HALF {
             Ok(0 as $NATIVE)
         } else if $FAIL_ON_ERROR {
-            Err(ArrowError::ComputeError(
-                arithmetic_overflow_error("integer").to_string(),
-            ))
+            Err(ArrowError::ArithmeticOverflow("Overflow".to_string()))
         } else {
             Ok((if x128 >= $HALF { $DIV } else { -$DIV }) as $NATIVE)
         }
     }};
 }
 
-// Lift an `ArrowError` from the rounding macros into a `DataFusionError`,
-// returning early from the enclosing function. Used by `round_integer_scalar!`.
+/// Lift an error out of the rounding kernels. `arity::try_unary` can only carry an `ArrowError`,
+/// so an ANSI overflow travels as `ArrowError::ArithmeticOverflow` and is rebuilt here as a
+/// `SparkError`, which is what carries the `ARITHMETIC_OVERFLOW` class and its parameters across
+/// the JNI boundary. Any other Arrow failure is passed through unchanged.
+fn lift_round_error(err: ArrowError) -> DataFusionError {
+    match err {
+        ArrowError::ArithmeticOverflow(_) => SparkError::RoundOverflow.into(),
+        other => {
+            DataFusionError::ArrowError(Box::from(other), Some(DataFusionError::get_back_trace()))
+        }
+    }
+}
+
+// Unwrap a rounding result on the scalar path, returning early from the enclosing function on
+// error. Used by `round_integer_scalar!`, which has no kernel to propagate through.
 macro_rules! round_scalar_result {
     ($RESULT:expr) => {
         match $RESULT {
             Ok(v) => Some(v),
-            Err(e) => {
-                return Err(DataFusionError::ArrowError(
-                    Box::from(e),
-                    Some(DataFusionError::get_back_trace()),
-                ))
-            }
+            Err(e) => return Err(lift_round_error(e)),
         }
     };
 }
@@ -110,16 +115,18 @@ macro_rules! round_integer_array {
             let half = div / 2;
             arrow::compute::kernels::arity::try_unary(array, |x| {
                 integer_round!(x, div, half, $FAIL_ON_ERROR)
-            })?
+            })
+            .map_err(lift_round_error)?
         } else if let Some(div) = 10_i128.checked_pow(point_abs) {
             let half = div / 2;
             arrow::compute::kernels::arity::try_unary(array, |x| {
                 integer_round_widened!(x, div, half, $NATIVE, $FAIL_ON_ERROR)
-            })?
+            })
+            .map_err(lift_round_error)?
         } else {
             // Even i128 cannot hold 10^(-point); every bounded native
             // integer rounds to 0.
-            arrow::compute::kernels::arity::try_unary(array, |_| Ok(0))?
+            arrow::compute::kernels::arity::try_unary(array, |_| Ok(0)).map_err(lift_round_error)?
         };
         Ok(ColumnarValue::Array(Arc::new(result)))
     }};
@@ -261,12 +268,14 @@ fn decimal_round_f(scale: &i8, point: &i64) -> Box<dyn Fn(i128) -> i128> {
 mod test {
     use std::sync::Arc;
 
-    use crate::spark_round;
+    use crate::{spark_round, SparkError};
 
-    use arrow::array::{Float32Array, Float64Array, Int64Array};
+    use arrow::array::{
+        ArrayRef, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
+    };
     use arrow::datatypes::DataType;
     use datafusion::common::cast::{as_float32_array, as_float64_array, as_int64_array};
-    use datafusion::common::{Result, ScalarValue};
+    use datafusion::common::{DataFusionError, Result, ScalarValue};
     use datafusion::physical_plan::ColumnarValue;
 
     #[test]
@@ -349,13 +358,101 @@ mod test {
     const WRAPPED_1E19: i64 = 10_000_000_000_000_000_000u64 as i64;
     const WRAPPED_MINUS_1E19: i64 = -WRAPPED_1E19;
 
+    /// Spark renders `ARITHMETIC_OVERFLOW` from `RoundBase` as the bare word `Overflow`, so the
+    /// native side has to hand the JVM a `SparkError` rather than a stringified Arrow error.
+    fn assert_round_overflow(err: DataFusionError) {
+        let DataFusionError::External(ref e) = err else {
+            panic!("expected DataFusionError::External carrying a SparkError, got: {err:?}");
+        };
+        match e.downcast_ref::<SparkError>() {
+            Some(SparkError::RoundOverflow) => {}
+            other => panic!("expected SparkError::RoundOverflow, got: {other:?}"),
+        }
+    }
+
     fn assert_round_int64_ansi_overflows(value: ColumnarValue) {
         let args = vec![value, ColumnarValue::Scalar(ScalarValue::Int64(Some(-19)))];
-        let err = spark_round(&args, &DataType::Int64, true).unwrap_err();
-        assert!(
-            err.to_string().to_ascii_lowercase().contains("overflow"),
-            "expected arithmetic overflow error, got: {err}"
-        );
+        assert_round_overflow(spark_round(&args, &DataType::Int64, true).unwrap_err());
+    }
+
+    /// The four integer widths at their largest value that rounds up out of range, on the
+    /// `integer_round!` path (`10^(-scale)` still fits the native type). This is the common
+    /// case; `assert_round_int64_ansi_overflows` covers the widened path.
+    #[test]
+    fn test_round_ansi_overflow_is_spark_error_for_all_int_widths() {
+        let arrays: Vec<(ArrayRef, DataType)> = vec![
+            (Arc::new(Int8Array::from(vec![125i8])), DataType::Int8),
+            (Arc::new(Int16Array::from(vec![32765i16])), DataType::Int16),
+            (
+                Arc::new(Int32Array::from(vec![2147483645i32])),
+                DataType::Int32,
+            ),
+            (
+                Arc::new(Int64Array::from(vec![9223372036854775805i64])),
+                DataType::Int64,
+            ),
+        ];
+        for (array, data_type) in arrays {
+            let args = vec![
+                ColumnarValue::Array(array),
+                ColumnarValue::Scalar(ScalarValue::Int64(Some(-1))),
+            ];
+            assert_round_overflow(spark_round(&args, &data_type, true).unwrap_err());
+        }
+
+        for (scalar, data_type) in [
+            (ScalarValue::Int8(Some(125)), DataType::Int8),
+            (ScalarValue::Int16(Some(32765)), DataType::Int16),
+            (ScalarValue::Int32(Some(2147483645)), DataType::Int32),
+            (
+                ScalarValue::Int64(Some(9223372036854775805)),
+                DataType::Int64,
+            ),
+        ] {
+            let args = vec![
+                ColumnarValue::Scalar(scalar),
+                ColumnarValue::Scalar(ScalarValue::Int64(Some(-1))),
+            ];
+            assert_round_overflow(spark_round(&args, &data_type, true).unwrap_err());
+        }
+    }
+
+    /// One below each value above still rounds down and succeeds, so the guard is not
+    /// over-broad.
+    #[test]
+    fn test_round_ansi_just_inside_boundary_succeeds() -> Result<()> {
+        for (scalar, data_type, expected) in [
+            (
+                ScalarValue::Int8(Some(124)),
+                DataType::Int8,
+                ScalarValue::Int8(Some(120)),
+            ),
+            (
+                ScalarValue::Int16(Some(32764)),
+                DataType::Int16,
+                ScalarValue::Int16(Some(32760)),
+            ),
+            (
+                ScalarValue::Int32(Some(2147483644)),
+                DataType::Int32,
+                ScalarValue::Int32(Some(2147483640)),
+            ),
+            (
+                ScalarValue::Int64(Some(9223372036854775804)),
+                DataType::Int64,
+                ScalarValue::Int64(Some(9223372036854775800)),
+            ),
+        ] {
+            let args = vec![
+                ColumnarValue::Scalar(scalar),
+                ColumnarValue::Scalar(ScalarValue::Int64(Some(-1))),
+            ];
+            let ColumnarValue::Scalar(result) = spark_round(&args, &data_type, true)? else {
+                unreachable!()
+            };
+            assert_eq!(result, expected);
+        }
+        Ok(())
     }
 
     #[test]
