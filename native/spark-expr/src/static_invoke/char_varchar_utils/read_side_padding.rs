@@ -205,8 +205,8 @@ fn spark_read_side_padding_internal<T: OffsetSizeTrait>(
             // row is longer than its target and passes through untruncated.
             let mut data_capacity = 0usize;
             let mut max_length = 0usize;
-            for length in int_pad_array.values() {
-                let length = (*length).max(0) as usize;
+            for length in int_pad_array.iter().flatten() {
+                let length = length.max(0) as usize;
                 data_capacity = data_capacity.saturating_add(length);
                 max_length = max_length.max(length);
             }
@@ -221,10 +221,11 @@ fn spark_read_side_padding_internal<T: OffsetSizeTrait>(
                 is_left_pad,
             };
 
+            // A null in either argument yields null, matching Spark: `rpad`/`lpad` return null
+            // for a null string or a null length.
             for (string, length) in string_array.iter().zip(int_pad_array) {
-                let length = length.unwrap();
-                match string {
-                    Some(string) => {
+                match (string, length) {
+                    (Some(string), Some(length)) => {
                         if length >= 0 {
                             padder.append(&mut builder, string, length as usize);
                         } else {
@@ -490,6 +491,40 @@ mod tests {
         assert_eq!(
             result_values(spark_lpad(&args).unwrap()),
             vec![Some("a".to_string()), Some("  abc".to_string()), None]
+        );
+    }
+
+    /// A null pad length yields null, as in Spark. The null sits between two non-null rows, so it
+    /// is not the whole batch, and the largest length comes from a row after it, so the capacity
+    /// pass has to skip the null and still find the maximum.
+    #[test]
+    fn null_length_from_array_yields_null() {
+        let lengths = ColumnarValue::Array(
+            Arc::new(Int32Array::from(vec![Some(4), None, Some(5)])) as ArrayRef,
+        );
+        let args = vec![
+            utf8(&[Some("abc"), Some("abc"), Some("abc")]),
+            lengths.clone(),
+        ];
+        assert_eq!(
+            result_values(spark_rpad(&args).unwrap()),
+            vec![Some("abc ".to_string()), None, Some("abc  ".to_string())]
+        );
+        assert_eq!(
+            result_values(spark_lpad(&args).unwrap()),
+            vec![Some(" abc".to_string()), None, Some("  abc".to_string())]
+        );
+    }
+
+    /// A null length and a null string both yield null, independently.
+    #[test]
+    fn null_length_and_null_string_both_yield_null() {
+        let lengths =
+            ColumnarValue::Array(Arc::new(Int32Array::from(vec![None, Some(4), None])) as ArrayRef);
+        let args = vec![utf8(&[Some("abc"), None, None]), lengths];
+        assert_eq!(
+            result_values(spark_rpad(&args).unwrap()),
+            vec![None, None, None]
         );
     }
 }
