@@ -23,7 +23,7 @@ use arrow::datatypes::IntervalDayTimeType;
 use arrow::datatypes::{DataType, IntervalUnit, Schema};
 use arrow::error::ArrowError;
 use datafusion::common::{DataFusionError, Result, ScalarValue};
-use datafusion::logical_expr::sort_properties::ExprProperties;
+use datafusion::logical_expr::sort_properties::{ExprProperties, SortProperties};
 use datafusion::{
     logical_expr::{interval_arithmetic::Interval, ColumnarValue},
     physical_expr::PhysicalExpr,
@@ -70,12 +70,50 @@ impl NegativeExpr {
     pub fn arg(&self) -> &Arc<dyn PhysicalExpr> {
         &self.arg
     }
+
+    /// Whether negating every value `range` can hold is strictly decreasing.
+    ///
+    /// Two's-complement negation maps the minimum of an integer type onto itself, so it
+    /// is strictly decreasing only over a range that stays above that minimum. `evaluate`
+    /// reaches it through `neg_wrapping` for every type in legacy mode, and in ANSI mode
+    /// for every type it does not route to the overflow-checked `neg` -- which is the
+    /// unsigned integers, since a signed one raises an overflow error there instead.
+    fn negation_is_strictly_decreasing(&self, range: &Interval) -> bool {
+        let data_type = range.data_type();
+        if self.fail_on_error && !data_type.is_unsigned_integer() {
+            return true;
+        }
+        match wrapping_order_boundary(&data_type) {
+            // A null lower bound is unbounded below, so it holds the boundary.
+            Some(boundary) => !range.lower().is_null() && range.lower() > &boundary,
+            // `ExprProperties::new_unknown` reports a `Null` range for an expression of
+            // any type, so a `Null` range is no evidence that this one cannot wrap.
+            None => data_type != DataType::Null,
+        }
+    }
 }
 
 impl std::fmt::Display for NegativeExpr {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "(- {})", self.arg)
     }
+}
+
+/// Wrapping negation is monotone only above this boundary: the minimum for signed
+/// integers and zero for unsigned integers. `None` for every other type, which Arrow's
+/// `neg_wrapping` leaves to the overflow-checked `neg`.
+fn wrapping_order_boundary(data_type: &DataType) -> Option<ScalarValue> {
+    Some(match data_type {
+        DataType::Int8 => ScalarValue::Int8(Some(i8::MIN)),
+        DataType::Int16 => ScalarValue::Int16(Some(i16::MIN)),
+        DataType::Int32 => ScalarValue::Int32(Some(i32::MIN)),
+        DataType::Int64 => ScalarValue::Int64(Some(i64::MIN)),
+        DataType::UInt8 => ScalarValue::UInt8(Some(0)),
+        DataType::UInt16 => ScalarValue::UInt16(Some(0)),
+        DataType::UInt32 => ScalarValue::UInt32(Some(0)),
+        DataType::UInt64 => ScalarValue::UInt64(Some(0)),
+        _ => return None,
+    })
 }
 
 fn map_neg_error(err: ArrowError, from_type: &'static str) -> DataFusionError {
@@ -223,10 +261,38 @@ impl PhysicalExpr for NegativeExpr {
             .map(|result| vec![result]))
     }
 
-    /// The ordering of a [`NegativeExpr`] is simply the reverse of its child.
+    /// A [`NegativeExpr`] reverses its child's ordering and reflects its child's range
+    /// about zero wherever negation is strictly decreasing over that range.
+    ///
+    /// Spark's legacy (non-ANSI) mode negates an integer with two's-complement wrapping,
+    /// where the minimum of the type is its own negation. An ascending
+    /// `[i32::MIN, i32::MIN + 1]` then becomes the still ascending `[i32::MIN, i32::MAX]`,
+    /// and a `[i32::MIN, -1]` range yields both `i32::MIN` and positive values. A range
+    /// that may hold the minimum therefore claims no ordering and the child type's full
+    /// range.
     fn get_properties(&self, children: &[ExprProperties]) -> Result<ExprProperties> {
-        let properties = children[0].clone().with_order(children[0].sort_properties);
-        Ok(properties)
+        let child = &children[0];
+        let unbounded = || Interval::make_unbounded(&child.range.data_type());
+        let strictly_decreasing = self.negation_is_strictly_decreasing(&child.range);
+
+        let range = if strictly_decreasing {
+            // `ScalarValue::arithmetic_negate` reports an error rather than a negation
+            // for an unsigned bound, for the minimum of a signed integer, and for the
+            // null bound of a decimal or interval range.
+            child.range.arithmetic_negate().or_else(|_| unbounded())
+        } else {
+            unbounded()
+        }?;
+
+        Ok(ExprProperties {
+            sort_properties: match child.sort_properties {
+                SortProperties::Singleton => SortProperties::Singleton,
+                order if strictly_decreasing => -order,
+                _ => SortProperties::Unordered,
+            },
+            range,
+            preserves_lex_ordering: false,
+        })
     }
 
     fn fmt_sql(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -237,9 +303,13 @@ impl PhysicalExpr for NegativeExpr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::{array::*, buffer::NullBuffer, datatypes::*};
+    use arrow::{array::*, buffer::NullBuffer, compute::SortOptions, datatypes::*};
     use datafusion::{
-        physical_expr::expressions::{Column, Literal},
+        logical_expr::sort_properties::SortProperties,
+        physical_expr::{
+            expressions::{Column, Literal},
+            EquivalenceProperties, PhysicalSortExpr,
+        },
         physical_plan::ColumnarValue,
     };
 
@@ -432,6 +502,210 @@ mod tests {
         ] {
             assert_spark_overflow(eval_scalar(scalar, true).unwrap_err(), from_type);
         }
+    }
+
+    fn ordered(descending: bool, nulls_first: bool) -> SortProperties {
+        SortProperties::Ordered(SortOptions {
+            descending,
+            nulls_first,
+        })
+    }
+
+    fn int32_interval(lower: i32, upper: i32) -> Interval {
+        Interval::try_new(
+            ScalarValue::Int32(Some(lower)),
+            ScalarValue::Int32(Some(upper)),
+        )
+        .unwrap()
+    }
+
+    fn unbounded(data_type: &DataType) -> Interval {
+        Interval::make_unbounded(data_type).unwrap()
+    }
+
+    fn child_properties(sort_properties: SortProperties, range: Interval) -> ExprProperties {
+        ExprProperties {
+            sort_properties,
+            range,
+            preserves_lex_ordering: true,
+        }
+    }
+
+    fn negate_properties(child: ExprProperties, fail_on_error: bool) -> Result<ExprProperties> {
+        NegativeExpr::new(Arc::new(Column::new("a", 0)), fail_on_error).get_properties(&[child])
+    }
+
+    /// Negation is strictly decreasing over `[1, 10]`, so it flips `descending`. Nulls stay
+    /// nulls, so `nulls_first` carries over.
+    #[test]
+    fn test_get_properties_reverses_child_ordering() {
+        for (child, expected) in [
+            (ordered(false, true), ordered(true, true)),
+            (ordered(true, false), ordered(false, false)),
+        ] {
+            let props =
+                negate_properties(child_properties(child, int32_interval(1, 10)), false).unwrap();
+            assert_eq!(props.sort_properties, expected);
+        }
+    }
+
+    #[test]
+    fn test_get_properties_negates_child_range() {
+        let props = negate_properties(
+            child_properties(SortProperties::Unordered, int32_interval(1, 10)),
+            false,
+        )
+        .unwrap();
+        assert_eq!(props.range, int32_interval(-10, -1));
+        assert!(!props.preserves_lex_ordering);
+    }
+
+    /// Legacy mode negates `[i32::MIN, i32::MIN + 1]` to `[i32::MIN, i32::MAX]`, which is
+    /// still ascending, so an ascending child supports no ordering claim and the reflected
+    /// bounds do not hold either.
+    #[test]
+    fn test_legacy_get_properties_drops_ordering_when_range_holds_int_min() {
+        let props = negate_properties(
+            child_properties(ordered(false, true), int32_interval(i32::MIN, i32::MIN + 1)),
+            false,
+        )
+        .unwrap();
+        assert_eq!(props.sort_properties, SortProperties::Unordered);
+        assert_eq!(props.range, unbounded(&DataType::Int32));
+    }
+
+    /// `[i32::MIN + 1, 10]` excludes the wrapping order boundary at `i32::MIN`, so legacy
+    /// mode still reverses the ordering and reflects the range.
+    #[test]
+    fn test_legacy_get_properties_reverses_ordering_when_range_excludes_int_min() {
+        let props = negate_properties(
+            child_properties(ordered(false, true), int32_interval(i32::MIN + 1, 10)),
+            false,
+        )
+        .unwrap();
+        assert_eq!(props.sort_properties, ordered(true, true));
+        assert_eq!(props.range, int32_interval(-10, i32::MAX));
+    }
+
+    /// Negating a constant yields a constant even where it wraps: `-i32::MIN` is `i32::MIN`,
+    /// which is still a single value.
+    #[test]
+    fn test_legacy_get_properties_keeps_a_singleton_child_singleton() {
+        let props = negate_properties(
+            child_properties(
+                SortProperties::Singleton,
+                int32_interval(i32::MIN, i32::MIN),
+            ),
+            false,
+        )
+        .unwrap();
+        assert_eq!(props.sort_properties, SortProperties::Singleton);
+        assert_eq!(props.range, unbounded(&DataType::Int32));
+    }
+
+    /// `ExprProperties::new_unknown` reports a `Null` range whatever the expression's real
+    /// type, and that is what every expression without its own `get_properties` yields, so a
+    /// `Null` range cannot rule out wrapping.
+    #[test]
+    fn test_legacy_get_properties_claims_no_ordering_for_an_untyped_range() {
+        let props = negate_properties(
+            child_properties(ordered(false, true), ExprProperties::new_unknown().range),
+            false,
+        )
+        .unwrap();
+        assert_eq!(props.sort_properties, SortProperties::Unordered);
+        assert_eq!(props.range, unbounded(&DataType::Null));
+    }
+
+    /// ANSI mode raises an overflow error instead of wrapping, so a range reaching down to
+    /// `i32::MIN` still reverses the ordering. Its reflection is not representable, so the
+    /// full range is reported.
+    #[test]
+    fn test_ansi_get_properties_reverses_ordering_when_range_holds_int_min() {
+        let props = negate_properties(
+            child_properties(ordered(false, true), int32_interval(i32::MIN, 10)),
+            true,
+        )
+        .unwrap();
+        assert_eq!(props.sort_properties, ordered(true, true));
+        assert_eq!(props.range, unbounded(&DataType::Int32));
+    }
+
+    /// ANSI mode routes unsigned integers to `neg_wrapping` rather than to the
+    /// overflow-checked `neg`, so `0` negates to itself there too and an unsigned range
+    /// down to `0` supports no ordering claim in either mode.
+    #[test]
+    fn test_ansi_get_properties_drops_ordering_for_an_unsigned_range_holding_zero() {
+        let props = negate_properties(
+            child_properties(ordered(false, true), unbounded(&DataType::UInt32)),
+            true,
+        )
+        .unwrap();
+        assert_eq!(props.sort_properties, SortProperties::Unordered);
+        assert_eq!(props.range, unbounded(&DataType::UInt32));
+    }
+
+    /// An unbounded decimal range is made of null decimal bounds, which
+    /// `ScalarValue::arithmetic_negate` has no negation for. Reporting the full range keeps
+    /// the ordering claim without turning a decimal negation into a planning error.
+    #[test]
+    fn test_get_properties_does_not_fail_on_an_unbounded_decimal_range() {
+        let decimal = DataType::Decimal128(10, 2);
+        let props = negate_properties(
+            child_properties(ordered(false, true), unbounded(&decimal)),
+            true,
+        )
+        .unwrap();
+        assert_eq!(props.sort_properties, ordered(true, true));
+        assert_eq!(props.range, unbounded(&decimal));
+    }
+
+    /// The premise the legacy guard in `get_properties` rests on, executed: negating an
+    /// ascending column that reaches `i32::MIN` leaves it ascending rather than descending.
+    #[test]
+    fn test_legacy_evaluation_of_int_min_leaves_an_ascending_column_ascending() {
+        let array: ArrayRef = Arc::new(Int32Array::from(vec![i32::MIN, i32::MIN + 1]));
+        let ColumnarValue::Array(result) = eval_array(array, false).unwrap() else {
+            panic!("expected array result")
+        };
+        let result = result.as_primitive::<Int32Type>();
+        assert_eq!(result, &Int32Array::from(vec![i32::MIN, i32::MAX]));
+        assert!(result.value(0) < result.value(1));
+    }
+
+    /// Sorts `a` ascending and returns what `EquivalenceProperties`, the caller that
+    /// actually reaches `get_properties`, derives for `-a`.
+    fn negation_of_ascending_column(fail_on_error: bool) -> SortProperties {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
+        let column = Arc::new(Column::new("a", 0));
+        let mut eq_properties = EquivalenceProperties::new(schema);
+        eq_properties.add_ordering([PhysicalSortExpr::new(
+            Arc::clone(&column) as Arc<dyn PhysicalExpr>,
+            SortOptions {
+                descending: false,
+                nulls_first: true,
+            },
+        )]);
+
+        let negated: Arc<dyn PhysicalExpr> = Arc::new(NegativeExpr::new(column, fail_on_error));
+        eq_properties.get_expr_properties(negated).sort_properties
+    }
+
+    /// ANSI negation is strictly decreasing, so sorting `a` ascending must not let
+    /// `EquivalenceProperties` conclude that `-a` is ascending too.
+    #[test]
+    fn test_ansi_equivalence_properties_report_negation_as_descending() {
+        assert_eq!(negation_of_ascending_column(true), ordered(true, true));
+    }
+
+    /// The column's range is unbounded, so legacy negation of it may wrap and
+    /// `EquivalenceProperties` must be given no ordering for `-a` at all.
+    #[test]
+    fn test_legacy_equivalence_properties_report_negation_as_unordered() {
+        assert_eq!(
+            negation_of_ascending_column(false),
+            SortProperties::Unordered
+        );
     }
 
     #[test]
