@@ -18,7 +18,7 @@
 use arrow::array::builder::GenericStringBuilder;
 use arrow::array::cast::as_dictionary_array;
 use arrow::array::types::Int32Type;
-use arrow::array::{make_array, Array, AsArray, DictionaryArray};
+use arrow::array::{make_array, new_null_array, Array, AsArray, DictionaryArray};
 use arrow::array::{ArrayRef, OffsetSizeTrait};
 use arrow::datatypes::DataType;
 use datafusion::common::{cast::as_generic_string_array, DataFusionError, ScalarValue};
@@ -42,12 +42,36 @@ pub fn spark_lpad(args: &[ColumnarValue]) -> Result<ColumnarValue, DataFusionErr
     spark_read_side_padding2(args, true, true)
 }
 
+fn null_padding_result(array: &ArrayRef) -> Result<ColumnarValue, DataFusionError> {
+    let supported = match array.data_type() {
+        DataType::Utf8 | DataType::LargeUtf8 => true,
+        DataType::Dictionary(_, value_type) => {
+            matches!(value_type.as_ref(), DataType::Utf8 | DataType::LargeUtf8)
+        }
+        _ => false,
+    };
+    if supported {
+        Ok(ColumnarValue::Array(new_null_array(
+            array.data_type(),
+            array.len(),
+        )))
+    } else {
+        Err(DataFusionError::Internal(format!(
+            "Unsupported data type {:?} for function rpad/lpad/read_side_padding",
+            array.data_type()
+        )))
+    }
+}
+
 fn spark_read_side_padding2(
     args: &[ColumnarValue],
     truncate: bool,
     is_left_pad: bool,
 ) -> Result<ColumnarValue, DataFusionError> {
     match args {
+        [ColumnarValue::Array(array), ColumnarValue::Scalar(ScalarValue::Int32(None))] => {
+            null_padding_result(array)
+        }
         [ColumnarValue::Array(array), ColumnarValue::Scalar(ScalarValue::Int32(Some(length)))] => {
             match array.data_type() {
                 DataType::Utf8 => spark_read_side_padding_internal::<i32>(
@@ -93,6 +117,12 @@ fn spark_read_side_padding2(
                     "Unsupported data type {other:?} for function rpad/read_side_padding",
                 ))),
             }
+        }
+        [ColumnarValue::Array(array), ColumnarValue::Scalar(ScalarValue::Int32(None)), ColumnarValue::Scalar(ScalarValue::Utf8(_))] => {
+            null_padding_result(array)
+        }
+        [ColumnarValue::Array(array), ColumnarValue::Scalar(ScalarValue::Int32(Some(_))), ColumnarValue::Scalar(ScalarValue::Utf8(None))] => {
+            null_padding_result(array)
         }
         [ColumnarValue::Array(array), ColumnarValue::Scalar(ScalarValue::Int32(Some(length))), ColumnarValue::Scalar(ScalarValue::Utf8(Some(string)))] =>
         {
@@ -590,6 +620,29 @@ mod tests {
         let args = vec![utf8(&[Some("abc"), Some("")]), len_array(&[None, None])];
         assert_eq!(result_values(spark_rpad(&args).unwrap()), vec![None, None]);
         let args = vec![utf8(&[Some("abc"), Some("")]), len_array(&[None, None])];
+        assert_eq!(result_values(spark_lpad(&args).unwrap()), vec![None, None]);
+    }
+
+    #[test]
+    fn null_scalar_arguments_yield_null() {
+        let args = vec![
+            utf8(&[Some("abc"), None]),
+            ColumnarValue::Scalar(ScalarValue::Int32(None)),
+        ];
+        assert_eq!(result_values(spark_rpad(&args).unwrap()), vec![None, None]);
+
+        let args = vec![
+            utf8(&[Some("abc"), None]),
+            len_scalar(5),
+            ColumnarValue::Scalar(ScalarValue::Utf8(None)),
+        ];
+        assert_eq!(result_values(spark_lpad(&args).unwrap()), vec![None, None]);
+
+        let args = vec![
+            utf8(&[Some("abc"), None]),
+            ColumnarValue::Scalar(ScalarValue::Int32(None)),
+            pad_scalar("x"),
+        ];
         assert_eq!(result_values(spark_lpad(&args).unwrap()), vec![None, None]);
     }
 }

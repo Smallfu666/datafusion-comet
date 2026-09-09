@@ -114,6 +114,16 @@ class CometStringExpressionSuite extends CometTestBase with CometCodegenAssertio
     }
   }
 
+  test("lpad/rpad with NULL scalar-subquery length") {
+    val data: Seq[(String, Option[Int])] = Seq(("hi", Some(5)), ("hi", None))
+    withParquetTable(data, "tbl") {
+      for (expr <- Seq("lpad", "rpad")) {
+        checkSparkAnswerAndOperator(
+          s"SELECT _1, $expr(_1, (SELECT max(_2) FROM tbl WHERE _2 IS NULL)) FROM tbl")
+      }
+    }
+  }
+
   test("lpad binary") {
     testBinaryPadding("lpad")
   }
